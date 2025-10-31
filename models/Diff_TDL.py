@@ -173,7 +173,7 @@ class ResNet(nn.Module):
 
         x = self.layer1(x)
         x = self.layer2(x)
-        x = self.layer2(x)
+        # x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
 
@@ -238,114 +238,184 @@ class AttentionFusion(nn.Module):
         super(AttentionFusion, self).__init__()
         self.attention_layers = nn.ModuleList([
             nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),  # 全局平均池化
-                nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),  # 通道降维
+                nn.AdaptiveAvgPool2d(1),  
+                nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),  
                 nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False),  # 通道恢复
-                nn.Sigmoid()  # 输出权重
+                nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False),  
+                nn.Sigmoid() 
             )
             for in_channels in in_channels_list
         ])
 
     def forward(self, feature_maps):
-        # 统一特征图的空间尺寸为第一个特征图的尺寸
-        target_size = feature_maps[0].shape[2:]  # 取第一个特征图的空间尺寸（高度和宽度）
+        target_size = feature_maps[0].shape[2:] 
         weighted_features = []
         for i, feature_map in enumerate(feature_maps):
-            # 将每个特征图插值到 target_size 大小
             resized_feature_map = F.interpolate(feature_map, size=target_size, mode='bilinear', align_corners=True)
-            # 计算注意力权重并加权
             attention = self.attention_layers[i](resized_feature_map)
             weighted_feature = resized_feature_map * attention
-            # 加入加权后的特征图
             weighted_features.append(weighted_feature)
 
-        # 拼接所有的加权特征图
         return torch.cat(weighted_features, dim=1)
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, channel, reduction=16):
+
+
+class DFCCBAM(nn.Module):
+    def __init__(self, channel, reduction=16, kernel_size=7, use_rdp=True, use_fft=False, eps=1e-6):
         super().__init__()
-        self.maxpool = nn.AdaptiveMaxPool2d(1)
+        self.eps = eps
+        self.use_rdp = use_rdp
+        self.use_fft = use_fft
+
+        # ---- Gaussian depthwise conv for pseudo-denoise ----
+        k = 5
+        sigma = 1.2
+        g = self._gaussian_kernel(k, sigma)  
+        self.register_buffer("g_kernel", g)  
+        self.depthwise = nn.Conv2d(channel, channel, kernel_size=k, padding=k//2,
+                                   groups=channel, bias=False)
+        with torch.no_grad():
+            self.depthwise.weight.copy_(g.expand(channel, 1, k, k))
+        self.depthwise.weight.requires_grad_(False) 
+
+
+        # ---- USM kernel for RDP ----
+        if use_rdp:
+            usm = torch.tensor([[[[0,-1,0],[-1,5,-1],[0,-1,0]]]], dtype=torch.float32)  # 3x3 unsharp mask
+            self.register_buffer("usm_kernel", usm)
+
         self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.maxpool = nn.AdaptiveMaxPool2d(1)
         self.se = nn.Sequential(
             nn.Conv2d(channel, channel // reduction, 1, bias=False),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Conv2d(channel // reduction, channel, 1, bias=False)
         )
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid_c = nn.Sigmoid()
 
-    def forward(self, x):
-        max_result = self.maxpool(x)
-        avg_result = self.avgpool(x)
-        max_out = self.se(max_result)
-        avg_out = self.se(avg_result)
-        output = self.sigmoid(max_out + avg_out)
-        return output
+        # ---- Spatial Attention ----
+        in_s = 5              
+        if use_rdp: in_s += 1 
+        padding = kernel_size // 2
+        self.conv_s = nn.Conv2d(in_s, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        self.sigmoid_s = nn.Sigmoid()
 
+    @staticmethod
+    def _gaussian_kernel(ks, sigma):
+        ax = torch.arange(ks) - (ks - 1) / 2.0
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+        kern = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kern /= kern.sum()
+        return kern.view(1, 1, ks, ks)
 
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2)
-        self.sigmoid = nn.Sigmoid()
+    def _pseudo_denoise(self, x):
+        return self.depthwise(x)
 
-    def forward(self, x):
-        max_result, _ = torch.max(x, dim=1, keepdim=True)
-        avg_result = torch.mean(x, dim=1, keepdim=True)
-        result = torch.cat([max_result, avg_result], 1)
-        output = self.conv(result)
-        output = self.sigmoid(output)
-        return output
+    def _rdp(self, x):
+        # USM(Gσ(x)) with groups conv (apply to channel-mean to减负担，再广播)
+        x_mean = x.mean(dim=1, keepdim=True)
+        gx = F.conv2d(x_mean, self.g_kernel, padding=self.g_kernel.shape[-1]//2)
+        usm = F.conv2d(gx, self.usm_kernel, padding=1)
+        return (x - usm)  # broadcast along channels
 
+    @staticmethod
+    def _grad(x):
+        sobel_x = x.new_tensor([[[[-1,0,1],[-2,0,2],[-1,0,1]]]])
+        sobel_y = x.new_tensor([[[[-1,-2,-1],[0,0,0],[1,2,1]]]])
+        gx = F.conv2d(x, sobel_x, padding=1)
+        gy = F.conv2d(x, sobel_y, padding=1)
+        mag = torch.sqrt(gx*gx + gy*gy + 1e-12)
+        return gx, gy, mag
 
-class CBAMBlock(nn.Module):
+    def _coherence(self, x_mean):
+        gx, gy, _ = self._grad(x_mean)
+        J11 = F.avg_pool2d(gx*gx, 3, 1, 1)
+        J22 = F.avg_pool2d(gy*gy, 3, 1, 1)
+        J12 = F.avg_pool2d(gx*gy, 3, 1, 1)
+        trace = J11 + J22
+        det = J11*J22 - J12*J12
+        tmp = torch.sqrt(torch.clamp(trace*trace - 4*det, min=0.0))
+        lam1 = (trace + tmp) * 0.5
+        lam2 = (trace - tmp) * 0.5
+        coh = (lam1 - lam2) / (lam1 + lam2 + 1e-6)
+        return coh
 
-    def __init__(self, channel, reduction=16, kernel_size=49):
-        super().__init__()
-        self.ca = ChannelAttention(channel=channel, reduction=reduction)
-        self.sa = SpatialAttention(kernel_size=kernel_size)
+    def _phase_consistency(self, x_mean):
+        gx, gy, gmag = self._grad(x_mean)
+        lap = F.conv2d(x_mean, x_mean.new_tensor([[[[0,1,0],[1,-4,1],[0,1,0]]]]), padding=1).abs()
+        pc = gmag / (gmag + lap + 1e-6)
+        return pc
 
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                init.constant_(m.weight, 1)
-                init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
+    def _norm(self, t):
+        mean = t.mean(dim=(2,3), keepdim=True)
+        std  = t.std(dim=(2,3), keepdim=True) + self.eps
+        return (t - mean) / std
 
-    def forward(self, x):
-        b, c, _, _ = x.size()
+    def forward(self, x, cond:dict=None):
         residual = x
-        out = x * self.ca(x)
-        out = out * self.sa(out)
+        B, C, H, W = x.shape
+
+        with torch.no_grad():
+            gx = self._pseudo_denoise(x.detach())
+            r  = (x - gx).abs()
+            r_mean = r.mean(dim=1, keepdim=True)
+
+        rdp_mean = None
+        if self.use_rdp:
+            with torch.no_grad():
+                rdp = self._rdp(x.detach()).abs()
+                rdp_mean = rdp.mean(dim=1, keepdim=True)
+
+        ca = self.se(self.avgpool(torch.nan_to_num(x))) \
+        + self.se(self.maxpool(torch.nan_to_num(x))) \
+        + self.se(self.avgpool(torch.nan_to_num(r)))
+        if self.use_rdp:
+            ca = ca + self.se(self.avgpool(torch.nan_to_num(rdp if self.use_rdp else x.new_zeros(()))))
+
+        ca = torch.nan_to_num(ca, nan=0.0, posinf=0.0, neginf=0.0)
+        ca = self.sigmoid_c(ca)
+        x  = x * ca
+
+        # ---------------- Spatial Attention ----------------
+        max_c, _ = torch.max(x, dim=1, keepdim=True)
+        avg_c    = torch.mean(x, dim=1, keepdim=True)
+        x_mean   = avg_c
+        
+        with torch.no_grad():
+            coh = self._coherence(torch.nan_to_num(x_mean))
+            pc  = self._phase_consistency(torch.nan_to_num(x_mean))
+
+            s_list = [ self._norm(max_c), self._norm(avg_c),
+                    self._norm(r_mean), self._norm(coh), self._norm(pc) ]
+            if self.use_rdp and rdp_mean is not None:
+                s_list.append(self._norm(rdp_mean))
+            s_in = torch.cat([torch.nan_to_num(t) for t in s_list], dim=1)
+
+        sa = self.sigmoid_s(self.conv_s(s_in))
+        sa = torch.nan_to_num(sa, nan=0.0, posinf=0.0, neginf=0.0)
+
+        out = x * sa
+        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return out + residual
 
 
-class TIFD(ResNet50):
+
+class TIFD_CBAM(ResNet50):
     def __init__(self, nclass, aux=False, n_input=3, **kwargs):
-        super(TIFD, self).__init__(pretrained=True, n_input=n_input)
+        super(TIFD_CBAM, self).__init__(pretrained=True, n_input=n_input)
         self.num_class = nclass
         self.aux = aux
         self.head = _DAHead(2048 + 256 + 512 + 1024 + 2048, self.num_class, aux, **kwargs)
 
         self.effic = EfficientNetB3()
 
-        # CBAM模块
-        self.cbam_c4 = CBAMBlock(2048)  # 对c4使用CBAM
-        self.cbam_out5v = CBAMBlock(2048)  # 对out5v使用CBAM
-        self.cbam_out4h = CBAMBlock(1024)
-        self.cbam_out3h = CBAMBlock(512)
-        self.cbam_out2h = CBAMBlock(256)
+        self.cbam_c4    = DFCCBAM(2048, use_rdp=True)  
+        self.cbam_out5v = DFCCBAM(2048, use_rdp=False)
+        self.cbam_out4h = DFCCBAM(1024, use_rdp=True)  
+        self.cbam_out3h = DFCCBAM(512,  use_rdp=True)   
+        self.cbam_out2h = DFCCBAM(256,  use_rdp=False)   
 
-        # 初始化 AttentionFusion 模块
         self.attention_fusion = AttentionFusion([2048, 256, 512, 1024, 2048])
 
     def forward(self, x):
@@ -357,20 +427,17 @@ class TIFD(ResNet50):
         out2h, out3h, out4h, out5v = self.effic(x)
 
 
-        # 对特征层应用CBAM模块
         c4 = self.cbam_c4(c4)
         out5v = self.cbam_out5v(out5v)
         out4h = self.cbam_out4h(out4h)
         out3h = self.cbam_out3h(out3h)
         out2h = self.cbam_out2h(out2h)
 
-        # 使用 AttentionFusion 进行加权融合
         combined_features = self.attention_fusion([c4, out2h, out3h, out4h, out5v])
 
-        # 通过DAHead进行分类预测
         outputs = []
         x = self.head(combined_features)
-        x0 = F.interpolate(x[0], size, mode='bilinear', align_corners=True)  # 插值回原图尺寸
+        x0 = F.interpolate(x[0], size, mode='bilinear', align_corners=True)  
         outputs.append(x0)
 
         return x0
@@ -487,7 +554,7 @@ class _DAHead(nn.Module):
 
 
 def get_TIFD(backbone='resnet50', pretrained_base=True, nclass=1, n_input=3, **kwargs):
-    model = TIFD(nclass, backbone=backbone,
+    model = TIFD_CBAM(nclass, backbone=backbone,
                                pretrained_base=pretrained_base,
                                n_input=n_input,
                                **kwargs)
